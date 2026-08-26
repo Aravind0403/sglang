@@ -269,7 +269,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)

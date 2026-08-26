@@ -75,6 +75,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    # copied from PR #34067
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
+
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
