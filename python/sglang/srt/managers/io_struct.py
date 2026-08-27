@@ -2139,7 +2139,9 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (
+    LoRAUpdateOutput
+)
 
 
 class BlockReqType(Enum):
