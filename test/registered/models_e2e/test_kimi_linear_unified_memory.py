@@ -13,11 +13,20 @@ resolves to (`fa3` on this suite's H100 runner, also the H200 default). Both
 defects found in review on #32972 were reachable only under a resolved default,
 which a pinned test hides by construction.
 
+`TestKimiLinearUnifiedMemoryDCP` adds decode context parallelism on top. There
+the allocator's virtual id space is WIDENED (dcp_size logical ids per stored
+row) while the pool still holds this rank's shard only, so the two id-space
+transforms -- the DCP owner rule and the virtual->dense translate -- have to
+compose in the right order. `--attention-backend flashinfer` is pinned because
+it is the only DCP-capable MLA backend converted to that contract.
+
 Reference GSM8K, all with `--enable-unified-memory`:
   - 2x H200 TP2, resolved default (fa3): 0.917 @400, vs 0.915 static (1 sigma
     ~= 0.015). This file as written scores 0.920 @200.
   - 2x H200 TP2, `--attention-backend triton`: 0.900 @400.
   - 1x B300 TP1: 0.915 flashinfer, 0.900 trtllm_mla, @200.
+  - 2x H200 TP2 DCP2 flashinfer: 0.915 @200, vs 0.910 static DCP2 and 0.910
+    unified without DCP (same backend, same box).
 
 Nightly-only: a second full 48B server launch is too much for per-PR CI on top
 of the existing Kimi-Linear e2e coverage.
@@ -32,7 +41,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=570, stage="nightly", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1140, stage="nightly", runner_config="4-gpu-h100")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -49,6 +58,34 @@ class TestKimiLinearUnifiedMemory(
         "--trust-remote-code",
         "--tp-size",
         "2",
+        "--chunked-prefill-size",
+        "2048",
+        "--enable-unified-memory",
+    ]
+
+
+class TestKimiLinearUnifiedMemoryDCP(
+    GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    """Unified memory + decode context parallelism.
+
+    `test_prefix_cache_branching` is the sharp one here: a radix hit replays
+    widened virtual locs whose pages may have moved under compaction, and each
+    rank must recover the same physical page from them while keeping a
+    different row inside it.
+    """
+
+    model = KIMI_LINEAR_MODEL
+    cache_chunk_size = 64
+    gsm8k_score_threshold = 0.88
+    other_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "2",
+        "--dcp-size",
+        "2",
+        "--attention-backend",
+        "flashinfer",
         "--chunked-prefill-size",
         "2048",
         "--enable-unified-memory",

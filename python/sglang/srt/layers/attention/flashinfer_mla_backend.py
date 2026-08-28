@@ -908,24 +908,13 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
-            # Unified pool: VIRTUAL -> DENSE, written back IN PLACE.
-            #
-            # On the cuda-graph replay path `kv_indices` IS the capture-stable
-            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
-            # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
-            # the kv_indices argument entirely -- rebinding the local name to a
-            # fresh tensor would leave the graph reading VIRTUAL ids. Only the
-            # [:paged_kernel_lens_sum] prefix the index kernel just filled is
-            # translated; the stale tail is left alone so it can never index the
-            # v2p table out of bounds. The int64 translate result narrows back to
-            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
-            # fit comfortably).
-            if self._translate_kv_loc_dense is not None:
-                valid = kv_indices[:paged_kernel_lens_sum]
-                valid.copy_(self._translate_kv_loc_dense(valid))
-
+            # DCP first, then the unified translate: `plan_dcp_decode_metadata`
+            # applies the owner rule to the RAW req_to_token ids and collapses
+            # `loc // dcp_size`, so it must see virtual ids. It compacts this
+            # rank's shard into the front of the buffer and returns its length.
+            n_kernel_ids = paged_kernel_lens_sum
             if get_parallel().dcp_enabled:
-                plan_dcp_decode_metadata(
+                n_kernel_ids = plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
                     kv_indices,
@@ -933,6 +922,21 @@ class FlashInferMLAIndicesUpdaterDecode:
                     fast_decode_kwargs,
                     bs,
                 )
+
+            # Unified pool: VIRTUAL -> DENSE, written back IN PLACE.
+            #
+            # On the cuda-graph replay path `kv_indices` IS the capture-stable
+            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
+            # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
+            # the kv_indices argument entirely -- rebinding the local name to a
+            # fresh tensor would leave the graph reading VIRTUAL ids. Only the
+            # prefix the index kernel just filled is translated; the stale tail
+            # is left alone so it can never index the v2p table out of bounds.
+            # The int64 translate result narrows back to the buffer's int32 on
+            # copy_ (flashinfer requires int32; dense ids fit comfortably).
+            if self._translate_kv_loc_dense is not None and n_kernel_ids > 0:
+                valid = kv_indices[:n_kernel_ids]
+                valid.copy_(self._translate_kv_loc_dense(valid))
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -1080,7 +1084,13 @@ class FlashInferMLAIndicesUpdaterPrefill:
             # Prefill is not cuda-graph captured under unified memory, so an eager
             # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
             # 1e7 << 2^31); the flashinfer wrapper requires int32.
-            if self._translate_kv_loc_dense is not None:
+            #
+            # Skipped under DCP: the paged prefill reads the all-gathered
+            # `dcp_kv_buffer` and `attn_dcp_metadata.dcp_kv_indices` (offsets into
+            # that buffer) replaces `kv_indices` below, so translating here is not
+            # just dead work -- these are WIDENED ids, and `virt // page_size`
+            # would run off the end of the v2p table.
+            if self._translate_kv_loc_dense is not None and attn_dcp_metadata is None:
                 kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]

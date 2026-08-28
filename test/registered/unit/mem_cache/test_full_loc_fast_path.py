@@ -223,11 +223,17 @@ class TestHybridLinearMLARouting(unittest.TestCase):
 
     - `set_kv_buffer` (MLA branch) mirrors the MHA branch — write the
       pre-translated `KVWriteLoc.full_loc` when present (unified pool, where it
-      carries the DENSE loc), else the raw `loc` (static pool, already physical).
-    - `set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs and apply
-      `_full_translate` exactly once (identity for a static pool)."""
+      carries the DENSE loc), else translate the raw `loc` (identity for a
+      static pool, where it is already physical).
+    - `set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs and
+      translate exactly once (identity for a static pool).
+    - Reads go through `_full_translate` and writes through
+      `_full_write_translate`. The two differ under decode context parallelism:
+      a write loc is still WIDENED and carries the owner rule in
+      `loc % dcp_size`, while read indices arrive already collapsed. Collapsing
+      them back into one hook silently mistranslates every DCP write."""
 
-    def _make_bare_pool(self, translate=None):
+    def _make_bare_pool(self, translate=None, write_translate=None):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         pool = object.__new__(HybridLinearKVPool)
@@ -235,6 +241,9 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         pool.use_mla = True
         pool.full_attention_layer_id_mapping = {0: 0}
         pool._full_translate = translate if translate is not None else (lambda x: x)
+        pool._full_write_translate = (
+            write_translate if write_translate is not None else (lambda x: x)
+        )
         return pool
 
     def test_mla_writes_full_loc_from_write_loc(self):
@@ -272,13 +281,12 @@ class TestHybridLinearMLARouting(unittest.TestCase):
         self.assertIs(forwarded, phys_loc)
 
     def test_set_mla_kv_buffer_translates_exactly_once(self):
-        calls = []
+        read_calls, write_calls = [], []
 
-        def translate(ids):
-            calls.append(ids)
-            return ids + 100
-
-        pool = self._make_bare_pool(translate=translate)
+        pool = self._make_bare_pool(
+            translate=lambda ids: (read_calls.append(ids), ids + 100)[1],
+            write_translate=lambda ids: (write_calls.append(ids), ids + 100)[1],
+        )
         virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
         layer = types.SimpleNamespace(layer_id=0)
 
@@ -286,11 +294,31 @@ class TestHybridLinearMLARouting(unittest.TestCase):
             layer, virtual_loc, torch.zeros(3, 1, 6), torch.zeros(3, 1, 2)
         )
 
-        self.assertEqual(len(calls), 1)
+        # Exactly once, and through the WRITE hook — not the read one.
+        self.assertEqual(len(write_calls), 1)
+        self.assertEqual(read_calls, [])
         self.assertEqual(len(pool.full_kv_pool.mla_set_calls), 1)
         self.assertTrue(
             torch.all(pool.full_kv_pool.mla_set_calls[0] == virtual_loc + 100)
         )
+
+    def test_mla_set_kv_buffer_fallback_uses_the_write_hook(self):
+        """No `full_loc` (a backend with no per-step write buffer): the raw loc
+        must still go through the write translate, or a unified-pool virtual id
+        reaches the buffer untranslated."""
+        write_calls = []
+
+        pool = self._make_bare_pool(
+            write_translate=lambda ids: (write_calls.append(ids), ids + 100)[1]
+        )
+        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
+        layer = types.SimpleNamespace(layer_id=0)
+
+        pool.set_kv_buffer(layer, _loc_info(virtual_loc), torch.zeros(3, 1, 8), None)
+
+        self.assertEqual(len(write_calls), 1)
+        forwarded, _ = pool.full_kv_pool.calls[0]
+        self.assertTrue(torch.all(forwarded == virtual_loc + 100))
 
     def test_get_mla_kv_buffer_translates_exactly_once(self):
         calls = []

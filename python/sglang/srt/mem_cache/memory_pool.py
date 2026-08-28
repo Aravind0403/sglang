@@ -3742,6 +3742,10 @@ class HybridLinearKVPool(KVCache):
         # (`set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs);
         # identity for a static pool, `translate_kv_loc_dense` for the unified pool.
         self._full_translate = lambda ids: ids
+        # Same, for the WRITE loc. Split from `_full_translate` because under DCP
+        # `out_cache_loc` still carries the owner rule in `loc % dcp_size` while
+        # read indices arrive already collapsed by the DCP index kernels.
+        self._full_write_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -3982,9 +3986,13 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
-            # Mirror the MHA branch: `full_loc` is the unified pool's
-            # pre-translated (dense) loc; None for a static pool.
-            write_loc = full_loc if full_loc is not None else loc
+            # `full_loc` is the unified pool's pre-translated (dense) loc, set by
+            # the backend that owns a per-step write buffer; otherwise translate
+            # here, the same way `set_mla_kv_buffer` does (identity for a static
+            # pool, whose own DCP owner rule then applies).
+            write_loc = (
+                full_loc if full_loc is not None else self._full_write_translate(loc)
+            )
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
@@ -4031,13 +4039,14 @@ class HybridLinearKVPool(KVCache):
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         # Model-level MLA entry point: `loc` is a VIRTUAL loc under the unified
-        # pool, so translate to the dense id space here.
+        # pool, so translate to the dense id space here. Under DCP it is also
+        # WIDENED, which is why the write side has its own hook.
         #
         # `loc_is_dense`: the caller already translated `loc` (the unified-pool
         # cuda-graph decode precomputes it out-of-graph into a capture-stable
         # buffer, so the in-graph write does not capture a translate allocation).
         if not loc_is_dense:
-            loc = self._full_translate(loc)
+            loc = self._full_write_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -4202,7 +4211,13 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        *,
+        dcp_resolved: bool = False,
     ) -> None:
+        # `dcp_resolved`: `loc` already addresses this rank's rows (the unified
+        # pool's dense-id contract), so the write kernel must not re-apply the
+        # DCP owner rule. The DSA branches below have no such kernel argument.
+        assert not (dcp_resolved and (self.use_dsa or self.dsa_kv_cache_store_fp8))
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4243,6 +4258,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                dcp_resolved=dcp_resolved,
             )
 
     def set_mla_kv_buffer(

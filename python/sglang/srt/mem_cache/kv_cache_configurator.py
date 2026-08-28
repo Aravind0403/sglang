@@ -618,6 +618,10 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # DCP widens the allocator's virtual id space (dcp_size ids per stored
+            # row); the pool itself stays this rank's shard.
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         return bundle
 
