@@ -9,6 +9,7 @@ import unittest
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -24,7 +25,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -93,6 +94,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1144,9 +1146,7 @@ class UnifiedRadixCacheSuite:
         # Unlock -> should now be evictable
         cache.dec_lock_ref(
             m.last_device_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
-            ),
+            lock_result.to_dec_params(),
         )
         result = cache.evict(EvictParams(num_tokens=len(seq_a)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
@@ -1361,7 +1361,10 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.sanity_check()
 
@@ -1402,7 +1405,10 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.sanity_check()
 
@@ -1641,7 +1647,10 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.dec_lock_ref(last_device_node, lock_result.to_dec_params())
         cache.sanity_check()
@@ -1701,14 +1710,10 @@ class UnifiedRadixCacheSuite:
         # strictly-lower-tier Mamba lock (the co-located Mamba is useless once SWA
         # is gone), leaving only the Full path-lock held. This is what guarantees
         # the later SWA-eviction cascade never meets a legitimately-locked Mamba.
-        lock_result = cache.inc_lock_ref(node_a)
-        self.assertGreaterEqual(
-            _device_lock_ref(cache, node_a, ComponentType.MAMBA),
-            1,
-            "Mamba locked before release",
-        )
-        cache.dec_swa_lock_only(node_a, lock_result.swa_uuid_for_lock)
-        self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.SWA), 0)
+        lock_result = cache.inc_lock_ref(node_a.id)
+        self.assertGreaterEqual(mamba_cd.lock_ref, 1, "Mamba locked before release")
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
+        self.assertEqual(swa_cd.lock_ref, 0)
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
             0,
@@ -1757,7 +1762,60 @@ class UnifiedRadixCacheSuite:
         )
         cache.sanity_check()
 
-        cache.dec_lock_ref(node_a, DecLockRefParams(swa_uuid_for_lock=None))
+        cache.dec_lock_ref(
+            node_a.id, DecLockRefParams(swa_uuid_for_lock=None), skip_swa=True
+        )
+        cache.sanity_check()
+
+    def test_mamba_opt_out_holder_cannot_release_another_holders_mamba_lock(self):
+        """Holder A takes the mamba lock; holder B opts out (lock_mamba=False)
+        on the same node. B's early SWA release and final release must leave
+        A's mamba lock intact -- a lost/defaulted receipt on B's side used to
+        decrement A's lock without tripping any assert."""
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq = self._make_seq(
+            1, (self.cfg.sliding_window_size // self.cfg.page_size) + 4
+        )
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        node = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+        )
+        self.assertIsNotNone(mamba_cd.value)
+
+        lock_a = cache.inc_lock_ref(node.id)
+        lock_b = cache.inc_lock_ref(node.id, lock_mamba=False)
+        self.assertTrue(lock_a.mamba_lock_acquired)
+        self.assertFalse(lock_b.mamba_lock_acquired)
+        self.assertEqual(
+            _device_lock_ref(cache, node, ComponentType.MAMBA), 1, "only A holds mamba"
+        )
+
+        # B: early SWA release, then final release -- both replay B's receipt.
+        cache.dec_swa_lock_only(node.id, lock_b.to_dec_params())
+        self.assertEqual(
+            _device_lock_ref(cache, node, ComponentType.MAMBA),
+            1,
+            "B's early release spares A",
+        )
+        cache.dec_lock_ref(node.id, lock_b.to_dec_params(), skip_swa=True)
+        self.assertEqual(
+            _device_lock_ref(cache, node, ComponentType.MAMBA),
+            1,
+            "B's final release spares A",
+        )
+
+        cache.dec_swa_lock_only(node.id, lock_a.to_dec_params())
+        self.assertEqual(
+            _device_lock_ref(cache, node, ComponentType.MAMBA),
+            0,
+            "A's release drops its own lock",
+        )
+        cache.dec_lock_ref(node.id, lock_a.to_dec_params(), skip_swa=True)
         cache.sanity_check()
 
     def test_swa_early_release_drops_co_located_mamba_lock(self):
@@ -1792,12 +1850,8 @@ class UnifiedRadixCacheSuite:
         # Early SWA release (decode advanced past the window), via the public
         # path the scheduler calls. The leaf's SWA is tombstoned and the
         # co-located lower-tier Mamba lock must drop in the same release.
-        cache.dec_swa_lock_only(node_a, lock_result.swa_uuid_for_lock)
-        self.assertEqual(
-            _device_lock_ref(cache, node_a, ComponentType.SWA),
-            0,
-            "SWA early-released",
-        )
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
+        self.assertEqual(swa_cd.lock_ref, 0, "SWA early-released")
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.MAMBA),
             0,
@@ -1957,12 +2011,12 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_device_evictable_leaf(node_a))
         cache.sanity_check()
 
-        lock_result = cache.inc_lock_ref(node_a)
+        lock_result = cache.inc_lock_ref(node_a.id)
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.SWA), 1)
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
         self.assertGreaterEqual(_device_lock_ref(cache, node_a, ComponentType.FULL), 1)
 
-        cache.dec_swa_lock_only(node_a, lock_result.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node_a.id, lock_result.to_dec_params())
         self.assertEqual(
             _device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA released"
         )
@@ -2035,8 +2089,8 @@ class UnifiedRadixCacheSuite:
                 self.assertEqual(cache.full_protected_size(), len(seq))
                 cache.sanity_check()
                 cache.dec_lock_ref(
-                    leaf,
-                    DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+                    leaf.id,
+                    lock_result.to_dec_params(),
                 )
                 cache.sanity_check()
 
@@ -2226,7 +2280,10 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.sanity_check()
 
@@ -2303,7 +2360,10 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.sanity_check()
 
@@ -2362,24 +2422,30 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, seq)
 
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        node = match.last_device_node
-        self.assertEqual(len(_node_children(cache, node)), 0)
-        self.assertIsNotNone(_device_value(cache, node, ComponentType.FULL))
-        self.assertIsNotNone(_device_value(cache, node, aux))
+        node = cache.resolve_node_handle(match.last_device_node)
+        self.assertEqual(len(node.children), 0)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNotNone(aux_cd.value)
 
-        lock_result = cache.inc_lock_ref(node)
+        # Reach the "FULL locked, aux unlocked" state the way production does:
+        # mamba via the decode-hold opt-out (lock_mamba=False), SWA via the
+        # early window release (its own first-class op).
+        aux_len = len(aux_cd.value)
+        if aux == ComponentType.MAMBA:
+            lock_result = cache.inc_lock_ref(node.id, lock_mamba=False)
+        else:
+            lock_result = cache.inc_lock_ref(node.id)
+            self.assertGreater(_device_lock_ref(cache, node, aux), 0)
+            cache.dec_swa_lock_only(
+                node.id,
+                lock_result.to_dec_params(),
+            )
+            # FULL still locked -> not a device leaf -> no inline evict; the
+            # value stays evictable for the explicit aux eviction below.
+            self.assertIsNotNone(aux_cd.value)
         self.assertGreater(_device_lock_ref(cache, node, ComponentType.FULL), 0)
-        self.assertGreater(_device_lock_ref(cache, node, aux), 0)
-
-        aux_len = len(_device_value(cache, node, aux))
-        cache.tree_core.set_component_protected_size(
-            aux, cache.tree_core.component_protected_size(aux) - aux_len
-        )
-        cache.tree_core.set_component_evictable_size(
-            aux, cache.tree_core.component_evictable_size(aux) + aux_len
-        )
-        cache.tree_core.set_component_device_lock_ref(node, aux, 0)
-        self.assertFalse(cache.tree_core.is_device_evictable_leaf(node))
+        self.assertEqual(_device_lock_ref(cache, node, aux), 0)
+        self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
 
         evict_params = EvictParams(num_tokens=0)
         if aux == ComponentType.SWA:
@@ -2398,8 +2464,9 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(cache.tree_core.is_node_in_device_lru(node, aux))
 
         cache.dec_lock_ref(
-            node,
-            DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+            node.id,
+            lock_result.to_dec_params(),
+            skip_swa=(aux == ComponentType.SWA),
         )
         cache.sanity_check()
 
@@ -2441,9 +2508,7 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             m_base.last_device_node,
-            DecLockRefParams(
-                swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
-            ),
+            lock_result.to_dec_params(),
         )
         # After unlock, base should be in evictable_device_leaves
         self.assertTrue(
@@ -2562,7 +2627,7 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             m.last_device_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
+            lr.to_dec_params(),
         )
         cache.sanity_check()
 
@@ -2625,7 +2690,7 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             m.last_device_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
+            lr.to_dec_params(),
         )
         cache.sanity_check()
 
@@ -4100,20 +4165,20 @@ class UnifiedRadixCacheSuite:
         # each evict() attempts the drop fallback on the parent.
         with mock.patch.object(cache.cache_controller, "write", return_value=None):
             # Pinned subtree root: drop declines, chain stays intact.
-            cache.inc_host_lock_ref(parent)
+            parent_pin = cache.inc_host_lock_ref(parent.id).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
-            cache.dec_host_lock_ref(parent)
+            cache.dec_host_lock_ref(parent.id, parent_pin)
 
             # Pinned host-only descendant: drop declines as well.
-            cache.inc_host_lock_ref(child)
+            child_pin = cache.inc_host_lock_ref(child.id).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
             m = cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
             )
             self.assertEqual(len(m.device_indices), len(parent_seq))
-            cache.dec_host_lock_ref(child)
+            cache.dec_host_lock_ref(child.id, child_pin)
 
             # Unpinned: the subtree drops and the child's host slots return.
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
@@ -4381,7 +4446,7 @@ class UnifiedRadixCacheSuite:
 
         cache.dec_lock_ref(
             m.last_device_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
+            lr.to_dec_params(),
         )
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", leaf))))
         self.assertGreaterEqual(len(m.device_indices), len(base))
@@ -5129,10 +5194,8 @@ class UnifiedRadixCacheSuite:
             cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
         finally:
             cache.dec_lock_ref(
-                parent,
-                DecLockRefParams(
-                    swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
-                ),
+                parent.id,
+                lock_result.to_dec_params(),
             )
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
         self.assertTrue(cache.tree_core.is_backuped(leaf))
@@ -6047,8 +6110,8 @@ class UnifiedRadixCacheSuite:
             cache.tree_core.component_evictable_size(ComponentType.SWA) - len(old_swa),
         )
 
-        temp_lock = cache.inc_lock_ref(leaf)
-        self.assertEqual(_device_lock_ref(cache, tombstone, ComponentType.SWA), 0)
+        temp_lock = cache.inc_lock_ref(leaf.id)
+        self.assertEqual(cd.lock_ref, 1)
 
         xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
@@ -6065,9 +6128,9 @@ class UnifiedRadixCacheSuite:
         )
         cache._apply_cache_actions(load_actions)
 
-        load_back_lock = cache.inc_lock_ref(leaf)
-        request_lock = cache.inc_lock_ref(leaf)
-        self.assertEqual(_device_lock_ref(cache, tombstone, ComponentType.SWA), 2)
+        load_back_lock = cache.inc_lock_ref(leaf.id)
+        request_lock = cache.inc_lock_ref(leaf.id)
+        self.assertEqual(cd.lock_ref, 3)
 
         cache.dec_lock_ref(leaf, temp_lock.to_dec_params())
         self.assertEqual(_device_lock_ref(cache, tombstone, ComponentType.SWA), 2)
@@ -6165,14 +6228,12 @@ class UnifiedRadixCacheSuite:
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
-    def test_hicache_full_temp_lock_skips_evicted_anchor_and_mirrors_on_release(
+    def test_hicache_full_temp_lock_covers_evicted_anchor_and_mirrors_on_release(
         self,
     ):
-        """Acquire records the evicted anchor in skip_lock_node_ids (phase 1)
-        and locks device-on ancestors only (phase 2). After load_back
-        restores the anchor, a second acquire covers it; releasing the
-        first must mirror the skip so the anchor's lock_ref is not
-        decremented twice.
+        """Segment locks count the evicted anchor too (no skip receipts), so
+        a value restored mid-hold stays correctly attributed: each release
+        takes back exactly its own ref regardless of interleaved holders.
         """
         if self._skip_unsupported_hicache_test():
             return
@@ -6193,21 +6254,19 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(_device_lock_ref(cache, y, ComponentType.FULL), 0)
         self.assertEqual(_device_lock_ref(cache, a, ComponentType.FULL), 0)
 
-        temp_lock = cache.inc_lock_ref(anchor)
-        self.assertEqual(_device_lock_ref(cache, anchor, ComponentType.FULL), 0)
-        self.assertEqual(_device_lock_ref(cache, y, ComponentType.FULL), 1)
-        self.assertEqual(_device_lock_ref(cache, a, ComponentType.FULL), 1)
-        self.assertIn(ComponentType.FULL, temp_lock.skip_lock_node_ids)
-        self.assertIn(anchor, temp_lock.skip_lock_node_ids[ComponentType.FULL])
+        temp_lock = cache.inc_lock_ref(anchor.id)
+        self.assertEqual(cd_anchor.lock_ref, 1)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
 
         cache.tree_core.set_component_device_value_raw(
             anchor, ComponentType.FULL, anchor_value
         )
 
-        second_lock = cache.inc_lock_ref(anchor)
-        self.assertEqual(_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
-        self.assertEqual(_device_lock_ref(cache, y, ComponentType.FULL), 2)
-        self.assertEqual(_device_lock_ref(cache, a, ComponentType.FULL), 2)
+        second_lock = cache.inc_lock_ref(anchor.id)
+        self.assertEqual(cd_anchor.lock_ref, 2)
+        self.assertEqual(cd_y.lock_ref, 2)
+        self.assertEqual(cd_a.lock_ref, 2)
 
         cache.dec_lock_ref(anchor, temp_lock.to_dec_params())
         self.assertEqual(_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
@@ -6246,8 +6305,8 @@ class UnifiedRadixCacheSuite:
             - len(old_mamba),
         )
 
-        temp_lock = cache.inc_lock_ref(node)
-        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
+        temp_lock = cache.inc_lock_ref(node.id)
+        self.assertEqual(cd.lock_ref, 1)
 
         xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.MAMBA, node, CacheTransferPhase.LOAD_BACK
@@ -6262,16 +6321,19 @@ class UnifiedRadixCacheSuite:
             cache_actions=[],
         )
 
-        load_back_lock = cache.inc_lock_ref(node)
-        request_lock = cache.inc_lock_ref(node)
-        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 2)
+        load_back_lock = cache.inc_lock_ref(node.id)
+        request_lock = cache.inc_lock_ref(node.id)
+        self.assertEqual(cd.lock_ref, 3)
 
         cache.dec_lock_ref(node, temp_lock.to_dec_params())
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 2)
 
-        cache.dec_lock_ref(node, load_back_lock.to_dec_params())
-        cache.dec_lock_ref(node, request_lock.to_dec_params())
-        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
+        cache.dec_lock_ref(node.id, load_back_lock.to_dec_params())
+        cache.dec_lock_ref(node.id, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
+        # The commit ran under held locks: the restored value must have been
+        # credited to protected, or the ledger drifts on the final release.
+        cache.sanity_check()
 
     def test_hicache_mixed_backup_evict_insert(self):
         """Complex scenario: backup some, evict, insert new, verify invariants."""
@@ -6334,10 +6396,8 @@ class UnifiedRadixCacheSuite:
             cache.evict(EvictParams(num_tokens=evict_tokens))
         finally:
             cache.dec_lock_ref(
-                parent,
-                DecLockRefParams(
-                    swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)
-                ),
+                parent.id,
+                lr.to_dec_params(),
             )
 
         self.assertTrue(
@@ -7035,7 +7095,7 @@ class TestResumableInsertWalk(_InsertWalkSuite):
 
         # Fill the host pool below len(top) free, keeping the on-path H-leaf
         # the oldest host entry and pinning the unbacked path root.
-        cache.inc_lock_ref(top)
+        top_lock = cache.inc_lock_ref(top.id)
         host_pool = cache.cache_controller.mem_pool_host
         start = 1000
         top_len = _node_key_length(cache, top)
@@ -7052,8 +7112,8 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             self.assertGreater(_write_backup(cache, filler, write_back=True), 0)
             cache.writing_check(write_back=True)
             cache.evict(EvictParams(num_tokens=count))
-            self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
-        cache.dec_lock_ref(top)
+            self.assertTrue(filler.evicted)
+        cache.dec_lock_ref(top.id, top_lock.to_dec_params())
 
         # The crossing backup evicts exactly the on-path H-leaf, then the
         # remaining suffix is recreated as a fresh leaf.
@@ -7300,13 +7360,15 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         node = m.last_device_node
 
-        lock_result = cache.inc_lock_ref(node)
-        self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
-        cache.dec_swa_lock_only(node, lock_result.swa_uuid_for_lock)
-        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
-        self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
+        lock_result = cache.inc_lock_ref(node.id)
+        self.assertGreaterEqual(swa_cd.lock_ref, 1)
+        cache.dec_swa_lock_only(node.id, lock_result.to_dec_params())
+        self.assertEqual(swa_cd.lock_ref, 0)
+        self.assertGreaterEqual(full_cd.lock_ref, 1)
 
-        cache.dec_lock_ref(node, DecLockRefParams(swa_uuid_for_lock=None))
+        cache.dec_lock_ref(
+            node.id, DecLockRefParams(swa_uuid_for_lock=None), skip_swa=True
+        )
         cache.sanity_check()
 
 
@@ -7436,7 +7498,7 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             (
                 "dec_swa_lock_only",
                 lambda: make(DecSwaLockOnlyResult),
-                lambda: cache.dec_swa_lock_only(node),
+                lambda: cache.dec_swa_lock_only(node.id, DecLockRefParams()),
                 None,
             ),
         ]
@@ -7947,7 +8009,10 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
 
         cache.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                mamba_lock_acquired=req.mamba_lock_acquired,
+            ),
         )
         cache.sanity_check()
 
@@ -8040,6 +8105,357 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestSegmentLockProtocol(_InsertWalkSuite):
+    """Segment-lock protocol regressions, replaying the 2026-08-21 stg
+    lock-theft failure classes (F1/F2) and the split hazards.
+
+    The protocol: a lock covers the contiguous node segment
+    [start, boundary-uuid], counting every node (tombstones included), so a
+    release needs only the two-field receipt and any ref==0 met inside the
+    segment is a hard protocol violation.
+    """
+
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
+    )
+
+    @staticmethod
+    def _swa_ref(node):
+        return node.component_data[ComponentType.SWA].lock_ref
+
+    @staticmethod
+    def _segment(cache, leaf, window):
+        """Nodes from leaf up to the position-based window boundary."""
+        nodes, covered, cur = [], 0, leaf
+        while cur is not cache.root_node and covered < window:
+            nodes.append(cur)
+            covered += len(cur.key)
+            cur = cur.parent
+        return nodes
+
+    def _match_leaf(self, cache, seq):
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        return cache.resolve_node_handle(m.last_device_node)
+
+    @staticmethod
+    def _deepest(cache):
+        """Structurally deepest node — bypasses SWA match validation, which
+        never adopts a holed window (simulates the stale-relock drift case)."""
+        node = cache.root_node
+        while node.children:
+            node = next(iter(node.children.values()))
+        return node
+
+    def test_rebuilt_tombstone_relock_release_no_theft(self):
+        """F1 attribution replay: A locks a window containing a tombstone; the
+        tombstone is rebuilt and locked by B mid-hold; A's release must leave
+        B's refs intact (the old skip-set protocol decremented B's lock)."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2 * sw)
+        # SWA data only for the last sw//2 positions: the window has a hole.
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", seq)),
+                value=self._alloc(allocator, len(seq)),
+                swa_evicted_seqlen=len(seq) - sw // 2,
+            )
+        )
+        leaf = self._deepest(cache)
+        segment = self._segment(cache, leaf, sw)
+        self.assertTrue(
+            any(n.component_data[ComponentType.SWA].value is None for n in segment),
+            "fixture must place a tombstone inside the window",
+        )
+
+        lock_a = cache.inc_lock_ref(leaf.id)
+        # Count-everything: every segment node carries A's ref, tombstones
+        # included, and the boundary uuid is always stamped.
+        self.assertIsNotNone(lock_a.swa_uuid_for_lock)
+        for n in segment:
+            self.assertEqual(self._swa_ref(n), 1)
+        cache.sanity_check()
+
+        # Rebuild the tombstones under A's lock (Recover path: FULL is
+        # locked); the rebuilt values must be credited to protected.
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", seq)),
+                value=self._alloc(allocator, len(seq)),
+                swa_evicted_seqlen=0,
+            )
+        )
+        cache.sanity_check()
+        leaf = self._deepest(cache)
+        segment = self._segment(cache, leaf, sw)
+        for n in segment:
+            self.assertIsNotNone(n.component_data[ComponentType.SWA].value)
+
+        lock_b = cache.inc_lock_ref(leaf.id)
+        for n in segment:
+            self.assertEqual(self._swa_ref(n), 2)
+
+        # THE regression: A's release takes back exactly A's refs.
+        cache.dec_lock_ref(leaf.id, lock_a.to_dec_params())
+        for n in segment:
+            self.assertEqual(self._swa_ref(n), 1)
+        cache.sanity_check()
+
+        cache.dec_lock_ref(leaf.id, lock_b.to_dec_params())
+        for n in segment:
+            self.assertEqual(self._swa_ref(n), 0)
+        cache.sanity_check()
+
+    def test_release_without_receipt_fails_loud(self):
+        """A release missing its boundary uuid must die at the segment edge
+        (ref==0 assert) instead of silently walking to root stealing other
+        holders' locks — the F1 failure made loud."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 3 * sw)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        lock = cache.inc_lock_ref(leaf.id)
+        self.assertIsNotNone(lock.swa_uuid_for_lock)
+
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(leaf.id, DecLockRefParams(swa_uuid_for_lock=None))
+
+    def test_double_release_fails_loud(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        lock = cache.inc_lock_ref(leaf.id)
+        cache.dec_lock_ref(leaf.id, lock.to_dec_params())
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(leaf.id, lock.to_dec_params())
+
+    def test_finish_after_early_release_without_skip_swa_fails_loud(self):
+        """F2 replay: retraction-after-early-release used to run a second SWA
+        walk that stole ancestors' locks; now it dies at the first node."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2 * sw)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        lock = cache.inc_lock_ref(leaf.id)
+        cache.dec_swa_lock_only(leaf.id, lock.to_dec_params())
+        with self.assertRaises(AssertionError):
+            cache.dec_lock_ref(leaf.id, lock.to_dec_params())
+
+    def test_finish_after_early_release_with_skip_swa(self):
+        """The correct F2 flow: skip_swa honors the early release."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2 * sw)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        lock = cache.inc_lock_ref(leaf.id)
+        cache.dec_swa_lock_only(leaf.id, lock.to_dec_params())
+        cache.dec_lock_ref(leaf.id, lock.to_dec_params(), skip_swa=True)
+        self.assertEqual(self._swa_ref(leaf), 0)
+        self.assertEqual(leaf.component_data[ComponentType.FULL].lock_ref, 0)
+        cache.sanity_check()
+
+    def test_split_under_lock_releases_balanced(self):
+        """A mid-segment split mints a new node with copied refs and migrates
+        the boundary uuid; the original receipt still releases exactly."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2 * sw)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = self._match_leaf(cache, seq)
+        lock = cache.inc_lock_ref(leaf.id)
+        pre_segment = self._segment(cache, leaf, sw)
+
+        # Diverge inside the window to force a split of a locked node.
+        fork = seq[: len(seq) - sw // 2] + self._make_seq(9000, sw)
+        self._insert(cache, allocator, req_to_token_pool, fork)
+        post_segment = self._segment(cache, leaf, sw)
+        self.assertGreater(len(post_segment), len(pre_segment))
+        for n in post_segment:
+            self.assertEqual(self._swa_ref(n), 1)
+
+        cache.dec_lock_ref(leaf.id, lock.to_dec_params())
+        for n in post_segment:
+            self.assertEqual(self._swa_ref(n), 0)
+        cache.sanity_check()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestSegmentLockFuzz(_InsertWalkSuite):
+    """Random lock/insert/evict interleavings with the tree's own ledger
+    recomputation (sanity_check) as the per-step oracle."""
+
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=8,
+        kv_size=4096,
+    )
+
+    def _run_seed(self, seed: int, steps: int = 120):
+        import random as _random
+
+        rng = _random.Random(seed)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chains: list[list[int]] = []
+        held: list[list] = []  # [node_id, receipt, released] entries
+
+        for step in range(steps):
+            op = rng.random()
+            try:
+                if op < 0.35 or not chains:
+                    # Insert: fresh chain or extend/diverge an existing one.
+                    if chains and rng.random() < 0.6:
+                        base = rng.choice(chains)
+                        cut = rng.randrange(1, len(base) + 1)
+                        seq = base[:cut] + self._make_seq(
+                            1000 * (step + 1), rng.randrange(2, 12)
+                        )
+                    else:
+                        seq = self._make_seq(1000 * (step + 1), rng.randrange(4, 20))
+                    if allocator.available_size() < len(seq):
+                        cache.evict(EvictParams(num_tokens=len(seq) * 2))
+                    if allocator.available_size() < len(seq):
+                        continue
+                    swa_evict = rng.randrange(0, len(seq)) if rng.random() < 0.3 else 0
+                    cache.insert(
+                        InsertParams(
+                            key=RadixKey(array("q", seq)),
+                            value=self._alloc(allocator, len(seq)),
+                            swa_evicted_seqlen=swa_evict,
+                        )
+                    )
+                    chains.append(seq)
+                elif op < 0.6:
+                    # Lock a random chain's current deepest device node.
+                    seq = rng.choice(chains)
+                    m = cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", seq)))
+                    )
+                    node = cache.resolve_node_handle(m.last_device_node)
+                    if node is cache.root_node:
+                        continue
+                    receipt = cache.inc_lock_ref(node.id)
+                    held.append([node.id, receipt, False])
+                elif op < 0.8 and held:
+                    # Full release of a random held lock.
+                    idx = rng.randrange(len(held))
+                    node_id, receipt, released = held.pop(idx)
+                    cache.dec_lock_ref(
+                        node_id, receipt.to_dec_params(), skip_swa=released
+                    )
+                elif op < 0.9 and held:
+                    # Early SWA release of a random not-yet-released lock.
+                    idx = rng.randrange(len(held))
+                    node_id, receipt, released = held[idx]
+                    if released or receipt.swa_uuid_for_lock is None:
+                        continue
+                    cache.dec_swa_lock_only(
+                        node_id,
+                        receipt.to_dec_params(),
+                    )
+                    held[idx][2] = True
+                else:
+                    cache.evict(
+                        EvictParams(
+                            num_tokens=rng.randrange(0, 32),
+                            swa_num_tokens=rng.randrange(0, 32),
+                        )
+                    )
+            except AssertionError:
+                raise
+            cache.sanity_check()
+
+        # Drain remaining locks; the tree must come back exactly balanced.
+        for node_id, receipt, released in held:
+            cache.dec_lock_ref(node_id, receipt.to_dec_params(), skip_swa=released)
+        cache.sanity_check()
+
+    def test_fuzz_seed0(self):
+        self._run_seed(0)
+
+    def test_fuzz_seed1(self):
+        self._run_seed(1)
+
+    def test_fuzz_seed2(self):
+        self._run_seed(2)
+
+
+class TestStreamingSessionLockLifecycle(CustomTestCase):
+    """A streaming session must persist swa_prefix_lock_released: closing or
+    aborting a session whose first turn early-released its SWA lock must not
+    release the SWA segment a second time."""
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=4,
+        kv_size=64,
+        max_context_len=64,
+    )
+
+    def _lock_and_early_release(self, cache, allocator):
+        tokens = array("q", range(1, 9))
+        value = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        node = match.last_device_node
+        lock = cache.inc_lock_ref(node)
+        self.assertIsNotNone(lock.swa_uuid_for_lock)
+        cache.dec_swa_lock_only(node, lock.to_dec_params())
+        return node, lock
+
+    def _streaming_req(self, node, lock, *, kv, req_pool_idx, session):
+        return SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            kv_committed_len=0,
+            kv=kv,
+            last_node=node,
+            cache_protected_len=0,
+            swa_uuid_for_lock=lock.swa_uuid_for_lock,
+            mamba_lock_acquired=lock.mamba_lock_acquired,
+            swa_prefix_lock_released=True,
+            mamba_pool_idx=None,
+            mamba_ping_pong_track_buffer=None,
+            mamba_next_track_idx=None,
+            mamba_last_track_idx=None,
+            mamba_last_track_seqlen=None,
+            mamba_branching_seqlen=None,
+            session=session,
+            finished_reason=None,
+        )
+
+    def test_close_after_early_release_releases_swa_once(self):
+        cache, allocator, _ = build_fixture(self.cfg)
+        node, lock = self._lock_and_early_release(cache, allocator)
+        req = self._streaming_req(node, lock, kv=None, req_pool_idx=None, session=None)
+        slot = SessionSlot()
+        cache.session.slots["s"] = slot
+        slot.save_from_req(req, is_first=True)
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+    def test_first_req_mid_abort_after_early_release(self):
+        cache, allocator, pool = build_fixture(self.cfg)
+        node, lock = self._lock_and_early_release(cache, allocator)
+        session = SimpleNamespace(
+            session_id="s2", streaming=True, abort_req=lambda: None
+        )
+        req = self._streaming_req(
+            node,
+            lock,
+            kv=SimpleNamespace(kv_allocated_len=0),
+            req_pool_idx=pool.free_slots.pop(),
+            session=session,
+        )
+        req.finished_reason = FINISH_ABORT()
+        self.assertTrue(cache.session.try_cache_finished_req(req))
+        cache.sanity_check()
 
 
 if __name__ == "__main__":

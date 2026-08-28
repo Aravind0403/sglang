@@ -51,10 +51,11 @@ class SessionSlot:
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
     cache_protected_len: int = 0
-    swa_uuid_for_lock: Optional[str] = None
-    # components the first req skipped locking on last_node, so release dec
-    # releases only what it took (may share the node with another req).
-    skip_lock_node_ids: dict = field(default_factory=dict)
+    swa_uuid_for_lock: Optional[int] = None
+    # Receipt bit for the first request's Mamba lock.
+    mamba_lock_acquired: bool = False
+    # Whether the first request already released its SWA lock.
+    swa_prefix_lock_released: bool = False
 
     # Mamba states
     mamba_pool_idx: Any = None
@@ -79,7 +80,8 @@ class SessionSlot:
             self.last_node = req.last_node
             self.cache_protected_len = req.cache_protected_len
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
-            self.skip_lock_node_ids = req.skip_lock_node_ids
+            self.mamba_lock_acquired = req.mamba_lock_acquired
+            self.swa_prefix_lock_released = req.swa_prefix_lock_released
 
         self.mamba_pool_idx = req.mamba_pool_idx
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
@@ -111,7 +113,8 @@ class SessionSlot:
         req.kv_committed_len = self.kv_committed_len
         req.kv = copy.copy(self.kv)
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
-        req.skip_lock_node_ids = self.skip_lock_node_ids
+        req.mamba_lock_acquired = self.mamba_lock_acquired
+        req.swa_prefix_lock_released = self.swa_prefix_lock_released
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
@@ -336,7 +339,8 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
-                    skip_lock_node_ids=req.skip_lock_node_ids,
+                    mamba_lock_acquired=req.mamba_lock_acquired,
+                    swa_prefix_lock_released=req.swa_prefix_lock_released,
                     mamba_pool_idx=req.mamba_pool_idx,
                     mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
@@ -452,12 +456,16 @@ class StreamingSession(BasePrefixCache):
         )
 
         if lock_node is not None:
+            # skip_swa is an SWA-cache extension kwarg; a slot can only have
+            # early-released when the inner cache supports SWA locks.
+            skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
             self.inner.dec_lock_ref(
                 lock_node,
                 DecLockRefParams(
                     swa_uuid_for_lock=slot.swa_uuid_for_lock,
-                    skip_lock_node_ids=slot.skip_lock_node_ids,
+                    mamba_lock_acquired=slot.mamba_lock_acquired,
                 ),
+                **skip,
             )
 
         if slot.is_holding_kv:

@@ -36,6 +36,7 @@ class _FakeInnerCache:
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
+        self.dec_lock_ref_skip_swa = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -48,6 +49,7 @@ class _FakeInnerCache:
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
         self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
+        self.dec_lock_ref_skip_swa.append(kwargs.get("skip_swa", False))
 
     def supports_mamba(self):
         return False
@@ -80,7 +82,8 @@ class _FakeReq:
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
-        self.skip_lock_node_ids = {}
+        self.mamba_lock_acquired = False
+        self.swa_prefix_lock_released = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -199,13 +202,11 @@ def test_nth_mid_abort_nukes_session_slot():
     assert req.req_pool_idx is None
 
 
-def test_release_session_threads_mamba_skip_ids():
-    """release_session must forward the slot's skip_lock_node_ids to
+def test_release_session_threads_mamba_lock_receipt():
+    """release_session must forward the slot's mamba lock receipt to
     dec_lock_ref. The first req's last_node may be full-only-locked (mamba
-    skipped at inc), so without the skip set the release would drop a mamba
+    not taken at inc), so without the receipt the release would drop a mamba
     lock the session never took -- another request's, on a shared node."""
-    from sglang.srt.mem_cache.unified_cache.components import ComponentType
-
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
@@ -219,7 +220,7 @@ def test_release_session_threads_mamba_skip_ids():
         kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
         last_node=lock_node,
         cache_protected_len=0,
-        skip_lock_node_ids={ComponentType.MAMBA: {42}},
+        mamba_lock_acquired=False,
     )
 
     tree_cache.release_session("session-a")
@@ -227,7 +228,35 @@ def test_release_session_threads_mamba_skip_ids():
     assert inner.dec_lock_ref_calls == [lock_node]
     params = inner.dec_lock_ref_params[0]
     assert params is not None
-    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
+    assert params.mamba_lock_acquired is False
+    assert inner.dec_lock_ref_skip_swa == [False]
+
+
+def test_release_session_skips_swa_after_early_release():
+    """A slot saved from a req that early-released its SWA lock
+    (swa_prefix_lock_released) must release with skip_swa, or the session
+    close double-releases the SWA segment."""
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        last_node=lock_node,
+        cache_protected_len=0,
+        swa_uuid_for_lock=7,
+        swa_prefix_lock_released=True,
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    assert inner.dec_lock_ref_skip_swa == [True]
 
 
 # Shrink tests removed: streaming sessions are append-only after the
