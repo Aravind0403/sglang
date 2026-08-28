@@ -28,6 +28,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_server_args,
+    get_spec,
     max_speculative_num_draft_tokens,
     publish,
     publish_role,
@@ -511,6 +512,25 @@ class _FakeResolvedArgs:
     tp_size: A[int, Arg(help="tp"), NS("parallel")] = 1
     pp_size: A[int, Arg(help="pp"), NS("parallel")] = 1
     _resolved_overrides: list = dataclasses.field(default_factory=list)
+
+    @property
+    def max_speculative_num_draft_tokens(self):
+        if self.speculative_num_draft_tokens is None:
+            return None
+        if not self.speculative_adaptive:
+            return self.speculative_num_draft_tokens
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        return (
+            max(
+                resolve_candidate_steps_from_config(
+                    cfg_path=self.speculative_adaptive_config
+                )
+            )
+            + 1
+        )
 
 
 class TestMoeFlagsGroup(_IsolatedServerArgs):
@@ -1247,13 +1267,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
 
 
 class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
-    """The adaptive draft-token bound is memoized on the config path, so the
-    memo has to end with the publication it was computed under.
-
-    Without that, a process that republishes with the same adaptive-config path
-    -- the file having been rewritten in between -- keeps the previous bound and
-    under-allocates the draft-token buffers sized from it.
-    """
+    """The adaptive draft-token bound is snapshotted at each publication."""
 
     def _write_config(self, steps):
         path = os.path.join(tempfile.mkdtemp(prefix="adaptive_cfg_"), "adaptive.json")
@@ -1275,7 +1289,7 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
 
         with open(path, "w") as handle:
             json.dump({"1": {"candidate_steps": [4]}}, handle)
-        # Same path, new contents: the memo must not survive the republish.
+        # The new publication must not retain the previous capacity.
         get_context().set_server_args(
             _FakeResolvedArgs(
                 speculative_num_draft_tokens=3,
@@ -1306,6 +1320,25 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
             )
         )
         self.assertEqual(max_speculative_num_draft_tokens(), 7)
+
+    def test_runtime_shrink_preserves_startup_bound(self):
+        get_context().set_server_args(
+            _FakeResolvedArgs(speculative_num_draft_tokens=16)
+        )
+        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
+        get_context().override("custom adaptive", speculative_num_draft_tokens=8)
+        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
+        self.assertEqual(max_speculative_num_draft_tokens(), 16)
+
+    def test_scoped_publish_restores_the_previous_bound(self):
+        get_context().set_server_args(
+            _FakeResolvedArgs(speculative_num_draft_tokens=16)
+        )
+        with get_context().override_server_args(speculative_num_draft_tokens=4):
+            self.assertEqual(get_spec().max_speculative_num_draft_tokens, 4)
+            self.assertEqual(max_speculative_num_draft_tokens(), 4)
+        self.assertEqual(get_spec().max_speculative_num_draft_tokens, 16)
+        self.assertEqual(max_speculative_num_draft_tokens(), 16)
 
 
 class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):

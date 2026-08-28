@@ -194,6 +194,55 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         with self.assertRaisesRegex(ValueError, "does not support overlap"):
             self.algo.create_worker(server_args)
 
+    def test_default_max_draft_tokens_is_the_startup_width(self):
+        server_args = SimpleNamespace(speculative_num_draft_tokens=7)
+        self.assertEqual(
+            self.algo.resolve_max_speculative_num_draft_tokens(server_args), 7
+        )
+
+    def test_server_args_property_dispatches_to_custom_override(self):
+        class CustomDraftBound(CustomSpecAlgo):
+            def resolve_max_speculative_num_draft_tokens(self, server_args):
+                return 11
+
+        @SpeculativeAlgorithm.register(
+            "MY_DRAFT_BOUND", supports_overlap=True, spec_class=CustomDraftBound
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="MY_DRAFT_BOUND",
+            speculative_num_draft_tokens=7,
+        )
+        self.assertEqual(server_args.max_speculative_num_draft_tokens, 11)
+
+    def test_server_args_rejects_a_custom_bound_below_the_active_width(self):
+        class InvalidDraftBound(CustomSpecAlgo):
+            def resolve_max_speculative_num_draft_tokens(self, server_args):
+                return 6
+
+        @SpeculativeAlgorithm.register(
+            "INVALID_DRAFT_BOUND",
+            supports_overlap=True,
+            spec_class=InvalidDraftBound,
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="INVALID_DRAFT_BOUND",
+            speculative_num_draft_tokens=7,
+        )
+        with self.assertRaisesRegex(ValueError, "below the configured"):
+            server_args.max_speculative_num_draft_tokens
+
 
 class TestValidatorHook(_RegistryIsolated):
     def test_validator_invocation_is_caller_driven(self):

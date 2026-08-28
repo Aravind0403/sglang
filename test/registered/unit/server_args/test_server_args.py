@@ -1686,6 +1686,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             )
 
             handle_speculative_decoding(args)
+            self.assertEqual(args.max_speculative_num_draft_tokens, 6)
 
         self.assertTrue(resolution_result(args, "speculative_adaptive"))
         self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 1)
