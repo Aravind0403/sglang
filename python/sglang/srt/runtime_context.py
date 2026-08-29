@@ -1774,6 +1774,11 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "has_flashinfer": "is_flashinfer_available",
 }
 
+# Not a yes/no fact: the compute capability itself. Same address, same override.
+_PLATFORM_VALUES: Dict[str, str] = {
+    "device_sm": "get_device_sm",
+}
+
 
 class PlatformContext:
     """The machine's own facts, with one place to override them.
@@ -1789,11 +1794,11 @@ class PlatformContext:
         object.__setattr__(self, "_overrides", {})
 
     def __getattr__(self, name: str) -> Any:
-        probe = _PLATFORM_PROBES.get(name)
+        probe = _PLATFORM_PROBES.get(name) or _PLATFORM_VALUES.get(name)
         if probe is None:
+            known = sorted(set(_PLATFORM_PROBES) | set(_PLATFORM_VALUES))
             raise AttributeError(
-                f"unknown platform fact {name!r}; known: "
-                f"{', '.join(sorted(_PLATFORM_PROBES))}"
+                f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
@@ -1809,7 +1814,7 @@ class PlatformContext:
         )
 
     def _install(self, **facts: Any) -> Dict[str, Any]:
-        unknown = set(facts) - set(_PLATFORM_PROBES)
+        unknown = set(facts) - set(_PLATFORM_PROBES) - set(_PLATFORM_VALUES)
         if unknown:
             raise ValueError(f"unknown platform fact(s): {sorted(unknown)}")
         overrides = object.__getattribute__(self, "_overrides")
@@ -1856,6 +1861,23 @@ class _PlatformOverride:
 
     def __exit__(self, *exc: Any) -> None:
         self.restore()
+
+    def __call__(self, fn: Any) -> Any:
+        """Also usable as a decorator, like the `patch` it replaces.
+
+        A fresh scope per call: the same object decorating two tests must not
+        share one saved state.
+        """
+        import functools
+
+        facts = dict(self._facts)
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with _PlatformOverride(**facts):
+                return fn(*args, **kwargs)
+
+        return wrapper
 
 
 def override_platform(**facts: Any) -> _PlatformOverride:

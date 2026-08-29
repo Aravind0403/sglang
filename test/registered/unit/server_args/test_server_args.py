@@ -832,8 +832,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
-            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             declared = _dsa_split_backend_resolution(view)
