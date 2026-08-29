@@ -833,6 +833,25 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
+def _resolved_or_field(server_args: Any, name: str, default: Any) -> Any:
+    """What resolution decided for `name`, falling back to the field.
+
+    Publishes that carry no config at all (sentinels, mocks) have neither, and
+    answer with `default`.
+    """
+    if server_args is None:
+        return default
+    from sglang.srt.arg_groups.overrides import resolution_result
+
+    try:
+        decided = resolution_result(server_args, name)
+    except Exception:
+        decided = None
+    if decided is not None:
+        return decided
+    return getattr(server_args, name, default)
+
+
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -914,9 +933,11 @@ class RuntimeContext:
         stash, which is what the bags are projected from.
         """
         # Seed the capture tier for the new lifecycle (defaults for sentinel
-        # and mock publishes, which carry no config).
-        self.flags.capture.enable_torch_compile = getattr(
-            server_args, "enable_torch_compile", False
+        # and mock publishes, which carry no config). Read through the
+        # resolution, not off the field: the field is the operator's input, and
+        # a handler -- or a scoped override -- may have decided otherwise.
+        self.flags.capture.enable_torch_compile = bool(
+            _resolved_or_field(server_args, "enable_torch_compile", False)
         )
         self._server_args = server_args
         # The adaptive draft-token bound memoizes on the config *path*, so a new
@@ -1145,7 +1166,6 @@ class _ServerArgsOverride:
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
-            _apply_fields,
             declare_late_resolution,
         )
 
@@ -1169,11 +1189,14 @@ class _ServerArgsOverride:
         }
         if declared:
             declare_late_resolution(server_args, "override_server_args", **declared)
-        # This hook stands in for a launch: the caller's values are both what
-        # the operator passed and what resolution decided, so they go on the
-        # record as well as into the stash. Production late resolution declares
-        # only -- there the record stays the operator's input.
-        _apply_fields(server_args, self._fields)
+        # Underscore names are not config at all -- they seed private caches the
+        # record keeps for itself (`_model_config` and friends), so they are a
+        # direct write and always were. The public fields are not written: the
+        # record carries the operator's input, and what the caller asked for is
+        # a resolution declaration, which is where every reader looks for it.
+        seeds = {name: value for name, value in self._fields.items() if name[0] == "_"}
+        for name, value in seeds.items():
+            object.__setattr__(server_args, name, value)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
