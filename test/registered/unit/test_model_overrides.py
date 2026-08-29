@@ -684,24 +684,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
+        def _hf(method):
+            # `get_quantization_config` reads exactly this off the hf config.
+            return SimpleNamespace(quantization_config={"quant_method": method})
+
         with override_platform(is_sm100=True):
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="fp8"
-            ):
-                self.assertEqual(
-                    _mimo_v2_overrides(_args(), None),
-                    {"moe_runner_backend": "flashinfer_trtllm"},
-                )
-                # An explicit user choice is never overwritten.
-                self.assertEqual(
-                    _mimo_v2_overrides(_args(moe_runner_backend="triton"), None), {}
-                )
+            self.assertEqual(
+                _mimo_v2_overrides(_args(), _hf("fp8")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            # An explicit user choice is never overwritten.
+            self.assertEqual(
+                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")), {}
+            )
             # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
             # pinned to flashinfer_trtllm.
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="mxfp4"
-            ):
-                self.assertEqual(_mimo_v2_overrides(_args(), None), {})
+            self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
@@ -1621,9 +1619,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with (
             override_platform(is_sm100=False),
             override_platform(is_cuda=True),
-            patch.object(
-                overrides_module, "get_device_capability", return_value=(9, 0)
-            ),
+            override_platform(device_capability=(9, 0)),
         ):
             # SM80-SM90 fp4: marlin
             self.assertEqual(
@@ -2230,8 +2226,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             args._model_config = SimpleNamespace(attention_arch=AttentionArch.MHA)
             return args
 
+        # The family holds its own binding, so the injection point is its
+        # module: this case is about what the family does with the answer, not
+        # about how the answer is computed.
+        from sglang.srt.arg_groups.model_overrides import (
+            qwen3_5_hybrid as qwen3_5_hybrid_module,
+        )
+
         with override_platform(is_sm100=True), patch.object(
-            overrides_module,
+            qwen3_5_hybrid_module,
             "get_default_attn_backend",
             lambda server_args, **_: server_args.default_backend_for_test,
         ):
@@ -2395,10 +2398,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ns = SimpleNamespace(**defaults)
             return ns
 
-        hf = SimpleNamespace()
-        with override_platform(is_hip=False), override_platform(
-            is_sm100=True
-        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+        # `get_quantization_config` reads the method off the hf config; an
+        # absent `quantization_config` is how "no declared quantisation" is said.
+        hf = SimpleNamespace(quantization_config=None)
+        with override_platform(is_hip=False), override_platform(is_sm100=True):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
@@ -2651,17 +2654,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ResolvedView(SimpleNamespace(**defaults))
 
         with override_platform(is_sm100=True):
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="fp8"
-            ):
-                # config-declared quant: detected + moe runner
-                self.assertEqual(
-                    _deepseek_moe_quant_resolution(_view()),
-                    {
-                        "quantization": "fp8",
-                        "moe_runner_backend": "flashinfer_trtllm",
-                    },
-                )
+            # config-declared quant: detected + moe runner. The fixture already
+            # takes the hf `quantization_config`, which is the only thing the
+            # pass reads to find the method.
+            self.assertEqual(
+                _deepseek_moe_quant_resolution(
+                    _view(quant_cfg={"quant_method": "fp8"})
+                ),
+                {
+                    "quantization": "fp8",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                },
+            )
             # non-deepseek arch guard (end-state list execution safety)
             self.assertEqual(
                 _deepseek_moe_quant_resolution(_view(arch="LlamaForCausalLM")), {}
@@ -2807,24 +2811,25 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         with override_platform(is_sm100=True):
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="fp8"
-            ):
-                self.assertEqual(
-                    _qwen3_moe_family_overrides(
-                        SimpleNamespace(
-                            quantization=None,
-                            _quantization_explicitly_unset=False,
-                            moe_a2a_backend="none",
-                            moe_runner_backend="auto",
-                        ),
-                        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+            self.assertEqual(
+                _qwen3_moe_family_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
                     ),
-                    {
-                        "quantization": "fp8",
-                        "moe_runner_backend": "flashinfer_trtllm",
-                    },
-                )
+                    # The hf config declares the method the family absorbs.
+                    SimpleNamespace(
+                        architectures=["Qwen3MoeForCausalLM"],
+                        quantization_config={"quant_method": "fp8"},
+                    ),
+                ),
+                {
+                    "quantization": "fp8",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                },
+            )
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 

@@ -1777,6 +1777,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
 # Not a yes/no fact: the compute capability itself. Same address, same override.
 _PLATFORM_VALUES: Dict[str, str] = {
     "device_sm": "get_device_sm",
+    "device_capability": "get_device_capability",
 }
 
 

@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_device_capability
 
 
 @_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
@@ -80,7 +79,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 or quantization == "modelopt_fp4"
             )
             and get_platform().is_cuda
-            and (8, 0) <= get_device_capability() < (10, 0)
+            and (8, 0) <= get_platform().device_capability < (10, 0)
         ):
             overrides["moe_runner_backend"] = "marlin"
             logger.info(
